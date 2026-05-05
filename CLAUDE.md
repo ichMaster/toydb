@@ -108,13 +108,13 @@ The project is built in order, each phase producing a runnable system:
 2. Type system + expressions + catalog
 3. Heap file storage (disk persistence)
 4. Buffer pool manager
-5. B+ tree index
-6. WAL + crash recovery
-7. Transactions (BEGIN/COMMIT/ROLLBACK, 2PL locking)
-8. Query planner + Volcano executor (replaces in-memory executor)
-9. TCP server + wire protocol
+5. TCP server + wire protocol
+6. B+ tree index
+7. WAL + crash recovery
+8. Transactions (BEGIN/COMMIT/ROLLBACK, 2PL locking)
+9. Query planner + Volcano executor (replaces in-memory executor)
 
-Phase 8 removes `executor_mem.py` and replaces it with `executor.py` (Volcano iterators). Until then, `executor_mem.py` executes AST directly.
+Phase 9 removes `executor_mem.py` and replaces it with `executor.py` (Volcano iterators). Until then, `executor_mem.py` executes AST directly.
 
 ## Claude Code Skills
 

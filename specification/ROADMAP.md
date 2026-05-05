@@ -11,11 +11,11 @@ Phase 1  SQL parser + REPL + in-memory storage        [SQL layer]
 Phase 2  Type system + expressions + catalog           [SQL layer]
 Phase 3  Heap file storage (disk persistence)          [Storage layer]
 Phase 4  Buffer pool manager                           [Storage layer]
-Phase 5  B-tree index                                  [Storage layer]
-Phase 6  WAL + crash recovery                          [Durability layer]
-Phase 7  Transactions                                  [Durability layer]
-Phase 8  Query planner + Volcano executor              [Infrastructure]
-Phase 9  TCP server + wire protocol                    [Infrastructure]
+Phase 5  TCP server + wire protocol                    [Infrastructure]
+Phase 6  B-tree index                                  [Storage layer]
+Phase 7  WAL + crash recovery                          [Durability layer]
+Phase 8  Transactions                                  [Durability layer]
+Phase 9  Query planner + Volcano executor              [Infrastructure]
 ```
 
 ---
@@ -515,7 +515,169 @@ Buffer pool: 64 frames
 
 ---
 
-## Phase 5: B-Tree Index
+## Phase 5: TCP Server + Wire Protocol
+
+### Component
+TCP network server. Binary wire protocol. Per-connection sessions. Python client library.
+
+### New Modules
+
+| Module        | Responsibility                                    |
+|---------------|---------------------------------------------------|
+| `server.py`   | TCP listener, thread-per-connection               |
+| `protocol.py` | Wire protocol: encode/decode binary frames        |
+| `session.py`  | Per-connection state: current txn, autocommit     |
+| `client.py`   | ToyDBClient: connect, execute, fetchall, close    |
+
+### Modified Modules
+
+| Module        | Changes                                            |
+|---------------|----------------------------------------------------|
+| `__main__.py` | Add `--mode server --port 9876` CLI option         |
+| `repl.py`     | Refactor to share execution pipeline with server   |
+
+### Wire Protocol
+
+```
+Frame layout:
+  [payload_length: 4 bytes, uint32, big-endian]
+  [message_type: 1 byte]
+  [payload: payload_length bytes]
+
+Message types:
+  0x01  QUERY         client -> server    UTF-8 SQL string
+  0x02  ROW_DATA      server -> client    column_count(2B) + [col_type(1B) + col_data(varlen)]...
+  0x03  OK            server -> client    affected_rows(4B)
+  0x04  ERROR         server -> client    error_code(2B) + UTF-8 message
+  0x05  READY         server -> client    empty (ready for next query)
+  0x06  COLUMN_DESC   server -> client    column_count(2B) + [name_len(2B) + name + type(1B)]...
+
+Query result sequence:
+  Server receives QUERY ->
+    If SELECT: send COLUMN_DESC, then ROW_DATA per row, then READY
+    If INSERT/UPDATE/DELETE: send OK with row count, then READY
+    If error: send ERROR, then READY
+```
+
+### Key Classes
+
+```python
+class ToyDBServer:
+    def __init__(self, host: str, port: int, engine: Engine): ...
+    def start(self) -> None:     # blocking, accepts connections
+    def stop(self) -> None: ...
+
+class Session:
+    def __init__(self, conn: socket, engine: Engine): ...
+    def handle(self) -> None:    # read queries, execute, send results
+    @property
+    def current_txn(self) -> Optional[TxnContext]: ...
+
+class Protocol:
+    @staticmethod
+    def read_frame(conn: socket) -> tuple[int, bytes]:  # (msg_type, payload)
+    @staticmethod
+    def write_frame(conn: socket, msg_type: int, payload: bytes) -> None: ...
+    @staticmethod
+    def encode_row(row: tuple, schema: list[ColumnDef]) -> bytes: ...
+    @staticmethod
+    def decode_row(data: bytes, schema: list[ColumnDef]) -> tuple: ...
+
+class ToyDBClient:
+    def __init__(self, host: str = "localhost", port: int = 9876): ...
+    def connect(self) -> None: ...
+    def execute(self, sql: str) -> list[tuple]: ...
+    def close(self) -> None: ...
+```
+
+### Server Architecture
+
+```
+Main thread:
+  socket.bind((host, port))
+  socket.listen()
+  while running:
+    conn, addr = socket.accept()
+    thread = Thread(target=Session(conn, engine).handle)
+    thread.start()
+
+Session.handle():
+  send READY
+  while True:
+    msg_type, payload = Protocol.read_frame(conn)
+    if msg_type == QUERY:
+      sql = payload.decode('utf-8')
+      try:
+        result = engine.execute(sql, session=self)
+        send result (COLUMN_DESC + ROW_DATA* or OK)
+      except ToyDBError as e:
+        send ERROR
+      send READY
+```
+
+### Demo Session
+
+Terminal 1 (server):
+```
+$ python -m toydb --mode server --port 9876
+[ToyDB] Server listening on 0.0.0.0:9876
+[ToyDB] Connection from 127.0.0.1:54321
+[ToyDB] Connection from 127.0.0.1:54322
+```
+
+Terminal 2 (client):
+```python
+from toydb.client import ToyDBClient
+
+db = ToyDBClient("localhost", 9876)
+db.connect()
+db.execute("CREATE TABLE test (id INT, val VARCHAR(50))")
+db.execute("INSERT INTO test VALUES (1, 'hello')")
+db.execute("INSERT INTO test VALUES (2, 'world')")
+rows = db.execute("SELECT * FROM test ORDER BY id")
+for row in rows:
+    print(row)
+# (1, 'hello')
+# (2, 'world')
+db.close()
+```
+
+Terminal 3 (REPL over TCP):
+```
+$ python -m toydb --mode client --host localhost --port 9876
+toydb(remote)> SELECT * FROM test;
++----+---------+
+| id | val     |
++----+---------+
+| 1  | hello   |
+| 2  | world   |
++----+---------+
+```
+
+### Tests
+
+- `test_protocol.py`: encode/decode round-trip for each message type.
+- `test_server.py`:
+  - Start server in background thread, connect with client, execute CREATE/INSERT/SELECT.
+  - Multiple concurrent clients inserting and reading.
+  - Client disconnects mid-query: server stays alive.
+  - Malformed frame: server sends ERROR and stays alive.
+- `test_client.py`: connect, execute, fetchall, close lifecycle.
+- `test_e2e.py` (extended): full end-to-end test through TCP: create table, insert, query, verify results.
+
+### Done Criteria
+
+- [ ] Server starts and listens on configured port.
+- [ ] Client library connects, sends queries, receives results.
+- [ ] Multiple concurrent connections work.
+- [ ] Graceful handling of client disconnect.
+- [ ] Error messages sent back to client with error codes.
+- [ ] REPL mode still works (--mode repl).
+- [ ] All tests pass.
+
+---
+
+## Phase 6: B-Tree Index
 
 ### Component
 B+ tree index stored on disk pages via the buffer pool. CREATE INDEX command. Index scan operator for point and range queries.
@@ -648,7 +810,7 @@ toydb> SELECT * FROM users WHERE age = 30;
 
 ---
 
-## Phase 6: WAL + Crash Recovery
+## Phase 7: WAL + Crash Recovery
 
 ### Component
 Write-ahead log for durability. Checkpoint mechanism. Redo recovery on startup after crash.
@@ -784,7 +946,7 @@ toydb> SELECT * FROM users WHERE id = 999;
 
 ---
 
-## Phase 7: Transactions
+## Phase 8: Transactions
 
 ### Component
 Transaction manager with BEGIN/COMMIT/ROLLBACK. Row-level locking with 2PL. Undo support for ROLLBACK using WAL before-images.
@@ -933,7 +1095,7 @@ toydb> SELECT COUNT(*) FROM orders WHERE status = 'cancelled';
 
 ---
 
-## Phase 8: Query Planner + Volcano Executor
+## Phase 9: Query Planner + Volcano Executor
 
 ### Component
 Logical plan tree from AST. Rule-based optimizer. Volcano iterator execution model. JOIN support. EXPLAIN command.
@@ -1107,175 +1269,6 @@ toydb> SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHE
 - [ ] Optimizer applies predicate pushdown and index selection.
 - [ ] All tests pass.
 
----
-
-## Phase 9: TCP Server + Wire Protocol
-
-### Component
-TCP network server. Binary wire protocol. Per-connection sessions. Python client library.
-
-### New Modules
-
-| Module        | Responsibility                                    |
-|---------------|---------------------------------------------------|
-| `server.py`   | TCP listener, thread-per-connection               |
-| `protocol.py` | Wire protocol: encode/decode binary frames        |
-| `session.py`  | Per-connection state: current txn, autocommit     |
-| `client.py`   | ToyDBClient: connect, execute, fetchall, close    |
-
-### Modified Modules
-
-| Module        | Changes                                            |
-|---------------|----------------------------------------------------|
-| `__main__.py` | Add `--mode server --port 9876` CLI option         |
-| `repl.py`     | Refactor to share execution pipeline with server   |
-
-### Wire Protocol
-
-```
-Frame layout:
-  [payload_length: 4 bytes, uint32, big-endian]
-  [message_type: 1 byte]
-  [payload: payload_length bytes]
-
-Message types:
-  0x01  QUERY         client -> server    UTF-8 SQL string
-  0x02  ROW_DATA      server -> client    column_count(2B) + [col_type(1B) + col_data(varlen)]...
-  0x03  OK            server -> client    affected_rows(4B)
-  0x04  ERROR         server -> client    error_code(2B) + UTF-8 message
-  0x05  READY         server -> client    empty (ready for next query)
-  0x06  COLUMN_DESC   server -> client    column_count(2B) + [name_len(2B) + name + type(1B)]...
-
-Query result sequence:
-  Server receives QUERY ->
-    If SELECT: send COLUMN_DESC, then ROW_DATA per row, then READY
-    If INSERT/UPDATE/DELETE: send OK with row count, then READY
-    If error: send ERROR, then READY
-```
-
-### Key Classes
-
-```python
-class ToyDBServer:
-    def __init__(self, host: str, port: int, engine: Engine): ...
-    def start(self) -> None:     # blocking, accepts connections
-    def stop(self) -> None: ...
-
-class Session:
-    def __init__(self, conn: socket, engine: Engine): ...
-    def handle(self) -> None:    # read queries, execute, send results
-    @property
-    def current_txn(self) -> Optional[TxnContext]: ...
-
-class Protocol:
-    @staticmethod
-    def read_frame(conn: socket) -> tuple[int, bytes]:  # (msg_type, payload)
-    @staticmethod
-    def write_frame(conn: socket, msg_type: int, payload: bytes) -> None: ...
-    @staticmethod
-    def encode_row(row: tuple, schema: list[ColumnDef]) -> bytes: ...
-    @staticmethod
-    def decode_row(data: bytes, schema: list[ColumnDef]) -> tuple: ...
-
-class ToyDBClient:
-    def __init__(self, host: str = "localhost", port: int = 9876): ...
-    def connect(self) -> None: ...
-    def execute(self, sql: str) -> list[tuple]: ...
-    def close(self) -> None: ...
-```
-
-### Server Architecture
-
-```
-Main thread:
-  socket.bind((host, port))
-  socket.listen()
-  while running:
-    conn, addr = socket.accept()
-    thread = Thread(target=Session(conn, engine).handle)
-    thread.start()
-
-Session.handle():
-  send READY
-  while True:
-    msg_type, payload = Protocol.read_frame(conn)
-    if msg_type == QUERY:
-      sql = payload.decode('utf-8')
-      try:
-        result = engine.execute(sql, session=self)
-        send result (COLUMN_DESC + ROW_DATA* or OK)
-      except ToyDBError as e:
-        send ERROR
-      send READY
-```
-
-### Demo Session
-
-Terminal 1 (server):
-```
-$ python -m toydb --mode server --port 9876
-[ToyDB] Server listening on 0.0.0.0:9876
-[ToyDB] Connection from 127.0.0.1:54321
-[ToyDB] Connection from 127.0.0.1:54322
-```
-
-Terminal 2 (client):
-```python
-from toydb.client import ToyDBClient
-
-db = ToyDBClient("localhost", 9876)
-db.connect()
-db.execute("CREATE TABLE test (id INT, val VARCHAR(50))")
-db.execute("INSERT INTO test VALUES (1, 'hello')")
-db.execute("INSERT INTO test VALUES (2, 'world')")
-rows = db.execute("SELECT * FROM test ORDER BY id")
-for row in rows:
-    print(row)
-# (1, 'hello')
-# (2, 'world')
-
-db.execute("BEGIN")
-db.execute("UPDATE test SET val = 'changed' WHERE id = 1")
-db.execute("COMMIT")
-db.close()
-```
-
-Terminal 3 (REPL over TCP):
-```
-$ python -m toydb --mode client --host localhost --port 9876
-toydb(remote)> SELECT * FROM test;
-+----+---------+
-| id | val     |
-+----+---------+
-| 1  | changed |
-| 2  | world   |
-+----+---------+
-```
-
-### Tests
-
-- `test_protocol.py`: encode/decode round-trip for each message type.
-- `test_server.py`:
-  - Start server in background thread, connect with client, execute CREATE/INSERT/SELECT.
-  - Multiple concurrent clients inserting and reading.
-  - Client disconnects mid-transaction: server aborts the transaction.
-  - Malformed frame: server sends ERROR and stays alive.
-- `test_client.py`: connect, execute, fetchall, close lifecycle.
-- `test_e2e.py` (extended): full end-to-end test through TCP: create table, insert, index, query, transaction, verify results.
-
-### Done Criteria
-
-- [ ] Server starts and listens on configured port.
-- [ ] Client library connects, sends queries, receives results.
-- [ ] Multiple concurrent connections work.
-- [ ] Transactions work across TCP (BEGIN in one query, COMMIT in another).
-- [ ] Graceful handling of client disconnect (abort open transaction).
-- [ ] Error messages sent back to client with error codes.
-- [ ] REPL mode still works (--mode repl).
-- [ ] All tests pass.
-
----
-
 ## Summary: What Works After Each Phase
 
 | Phase | You Can Do This                                              |
@@ -1284,11 +1277,11 @@ toydb(remote)> SELECT * FROM test;
 | 2     | Typed columns, complex expressions, ORDER BY, LIMIT, UPDATE |
 | 3     | All of the above, and data survives restart                  |
 | 4     | All of the above, with transparent page caching              |
-| 5     | CREATE INDEX, fast point and range queries                   |
-| 6     | All of the above, survives kill -9 (crash recovery)          |
-| 7     | BEGIN/COMMIT/ROLLBACK, concurrent access with locking        |
-| 8     | JOINs, GROUP BY, EXPLAIN, optimized query plans              |
-| 9     | Connect from another process over TCP                        |
+| 5     | Connect from another process over TCP                        |
+| 6     | CREATE INDEX, fast point and range queries                   |
+| 7     | All of the above, survives kill -9 (crash recovery)          |
+| 8     | BEGIN/COMMIT/ROLLBACK, concurrent access with locking        |
+| 9     | JOINs, GROUP BY, EXPLAIN, optimized query plans              |
 
 ## Dependency Graph
 
@@ -1299,16 +1292,19 @@ Phase 1 (parser + REPL)
 Phase 2 (types + catalog)
   |
   v
-Phase 3 (heap files) ---------> Phase 5 (B-tree) ----+
-  |                                                    |
-  v                                                    v
-Phase 4 (buffer pool) -------> Phase 6 (WAL) ------> Phase 7 (transactions)
+Phase 3 (heap files)
+  |
+  v
+Phase 4 (buffer pool)
+  |
+  v
+Phase 5 (TCP server) --------> Phase 6 (B-tree) ----+
+                                                      |
+                                                      v
+                                Phase 7 (WAL) ------> Phase 8 (transactions)
                                                        |
                                                        v
-                                                 Phase 8 (planner)
-                                                       |
-                                                       v
-                                                 Phase 9 (TCP server)
+                                                 Phase 9 (planner)
 ```
 
 Phases must be done in order 1 through 9. Each phase depends on all previous phases being complete.
